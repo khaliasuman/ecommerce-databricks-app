@@ -3,19 +3,17 @@ import pandas as pd
 import json
 import urllib.request
 from databricks.sdk import WorkspaceClient
+from databricks.vector_search.client import VectorSearchClient
 
 ENDPOINT_NAME = "ecommerce_vs_endpoint"
-INDEX_NAME    = "ecommerce_demo.sales.policy_chunks_index"
-LLM_ENDPOINT  = "databricks-meta-llama-3-3-70b-instruct"
+INDEX_NAME = "ecommerce_demo.sales.policy_chunks_index"
+LLM_ENDPOINT = "databricks-meta-llama-3-3-70b-instruct"
 
 @st.cache_resource
 def get_clients():
     w = WorkspaceClient()
-    # ✅ Fix: pass token and host explicitly to VectorSearchClient
-    from databricks.vector_search.client import VectorSearchClient
     vsc = VectorSearchClient(
         workspace_url=w.config.host,
-        service_principal_client_id=None,
         personal_access_token=w.config.token,
         disable_notice=True
     )
@@ -81,7 +79,11 @@ Answer:"""
     return call_llm(prompt, token, host), sources
 
 # Page config
-st.set_page_config(page_title="E-Commerce AI Assistant", page_icon="🛍️", layout="wide")
+st.set_page_config(
+    page_title="E-Commerce AI Assistant",
+    page_icon="🛍️",
+    layout="wide"
+)
 
 # Sidebar
 st.sidebar.title("🛍️ E-Commerce AI")
@@ -93,8 +95,8 @@ page = st.sidebar.radio(
 )
 
 w, vsc = get_clients()
-token  = w.config.token
-host   = w.config.host
+token = w.config.token
+host = w.config.host
 
 # Page 1: Policy Assistant
 if page == "💬 Policy Assistant":
@@ -132,13 +134,14 @@ elif page == "📊 Sales Predictions":
 
         col1, col2, col3 = st.columns(3)
         col1.metric("Total Customers", len(df))
-        col2.metric("Avg Predicted Value", f"₹{df['predicted_order_value'].mean():.2f}")
+        col2.metric("Avg Predicted Value", f"Rs.{df['predicted_order_value'].mean():.2f}")
         col3.metric("High Value Customers", len(df[df['value_tier'] == 'High Value']))
 
         st.markdown("### Predictions Table")
-        st.dataframe(df[["customer_id", "price", "quantity",
-                          "predicted_order_value", "value_tier"]],
-                     use_container_width=True)
+        st.dataframe(
+            df[["customer_id", "price", "quantity", "predicted_order_value", "value_tier"]],
+            use_container_width=True
+        )
 
         st.markdown("### Value Tier Distribution")
         tier_counts = df["value_tier"].value_counts().reset_index()
@@ -153,17 +156,28 @@ elif page == "📈 Sales Overview":
     st.title("📈 Sales Overview")
     st.markdown("Live data from your Delta Lake tables.")
     try:
-        orders   = read_table(w, "SELECT * FROM ecommerce_demo.sales.orders")
+        orders = read_table(w, "SELECT * FROM ecommerce_demo.sales.orders")
         products = read_table(w, "SELECT * FROM ecommerce_demo.sales.products")
-
-        products["price"]    = pd.to_numeric(products["price"], errors="coerce")
-        orders["quantity"]   = pd.to_numeric(orders["quantity"], errors="coerce")
-
+        products["price"] = pd.to_numeric(products["price"], errors="coerce")
+        orders["quantity"] = pd.to_numeric(orders["quantity"], errors="coerce")
         df = orders.merge(products, on="product_id")
         df["order_value"] = df["price"] * df["quantity"]
 
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Orders",  len(df))
-        col2.metric("Total Revenue", f"₹{df['order_value'].sum():.2f}")
-        col3.metric("Delivered",     len(df[df['status'] == 'delivered']))
-        col4.metric("Returned",
+        col1.metric("Total Orders", len(df))
+        col2.metric("Total Revenue", f"Rs.{df['order_value'].sum():.2f}")
+        col3.metric("Delivered", len(df[df['status'] == 'delivered']))
+        col4.metric("Returned", len(df[df['status'] == 'returned']))
+
+        st.markdown("### Revenue by Category")
+        cat_rev = df.groupby("category")["order_value"].sum().reset_index()
+        st.bar_chart(cat_rev.set_index("category"))
+
+        st.markdown("### Recent Orders")
+        st.dataframe(
+            df[["order_id", "product_name", "category", "quantity", "order_value", "status"]],
+            use_container_width=True
+        )
+
+    except Exception as e:
+        st.error(f"Error loading sales data: {e}")
