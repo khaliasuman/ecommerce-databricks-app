@@ -2,38 +2,56 @@ import streamlit as st
 import pandas as pd
 import json
 import urllib.request
+from databricks.vector_search.client import VectorSearchClient
 from databricks.sdk import WorkspaceClient
+from databricks import sql
 
-ENDPOINT_NAME = "ecommerce_vs_endpoint"
-INDEX_NAME    = "ecommerce_demo.sales.policy_chunks_index"
-LLM_ENDPOINT  = "databricks-meta-llama-3-3-70b-instruct"
+# ── Page config ──────────────────────────────────────────────
+st.set_page_config(
+    page_title="E-Commerce AI Assistant",
+    page_icon="🛍️",
+    layout="wide"
+)
+
+# ── Helpers ──────────────────────────────────────────────────
+@st.cache_resource
+def get_clients():
+    w = WorkspaceClient()
+    vsc = VectorSearchClient()
+    return w, vsc
 
 @st.cache_resource
-def get_workspace_client():
-    return WorkspaceClient()
+def get_sql_connection():
+    """Create a connection to the SQL warehouse"""
+    w = WorkspaceClient()
+    connection = sql.connect(
+        server_hostname=w.config.host.replace("https://", ""),
+        http_path=f"/sql/1.0/warehouses/96b47259ff35cccf",
+        access_token=w.config.token
+    )
+    return connection
 
-def read_table(w, sql):
-    try:
-        warehouse_id = next(w.warehouses.list()).id
-        result = w.statement_execution.execute_statement(
-            warehouse_id=warehouse_id,
-            statement=sql,
-            wait_timeout="30s"
-        )
-        if result.result and result.result.data_typed_array:
-            columns = [col.name for col in result.manifest.schema.columns]
-            rows = []
-            for row in result.result.data_typed_array:
-                rows.append([v.str if v.str is not None else None for v in row.values])
-            return pd.DataFrame(rows, columns=columns)
-    except Exception as e:
-        st.error(f"Table read error: {e}")
-    return pd.DataFrame()
+def query_table(table_name):
+    """Execute SELECT * FROM table and return as pandas DataFrame"""
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT * FROM {table_name}")
+    
+    # Fetch results and column names
+    columns = [desc[0] for desc in cursor.description]
+    rows = cursor.fetchall()
+    cursor.close()
+    
+    # Convert to pandas DataFrame
+    return pd.DataFrame(rows, columns=columns)
 
-def call_api(host, token, endpoint_path, payload):
-    data = json.dumps(payload).encode("utf-8")
+def call_llm(prompt, token, host):
+    data = json.dumps({
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 400
+    }).encode("utf-8")
     req = urllib.request.Request(
-        f"{host}{endpoint_path}",
+        f"{host}/serving-endpoints/databricks-meta-llama-3-3-70b-instruct/invocations",
         data=data,
         headers={
             "Authorization": f"Bearer {token}",
@@ -41,39 +59,21 @@ def call_api(host, token, endpoint_path, payload):
         }
     )
     with urllib.request.urlopen(req) as r:
-        return json.loads(r.read())
+        return json.loads(r.read())["choices"][0]["message"]["content"]
 
-def vector_search(host, token, question, num_results=3):
-    # Call Vector Search REST API directly - no VectorSearchClient needed
-    payload = {
-        "query_text": question,
-        "columns": ["title", "content"],
-        "num_results": num_results
-    }
-    index_path = INDEX_NAME.replace(".", "/")
-    response = call_api(
-        host, token,
-        f"/api/2.0/vector-search/indexes/{INDEX_NAME}/query",
-        payload
+def rag_answer(question, vsc, token, host):
+    index = vsc.get_index(
+        endpoint_name="ecommerce_vs_endpoint",
+        index_name="ecommerce_demo.sales.policy_chunks_index"
     )
-    return response.get("result", {}).get("data_array", [])
-
-def call_llm(host, token, prompt):
-    response = call_api(
-        host, token,
-        f"/serving-endpoints/{LLM_ENDPOINT}/invocations",
-        {
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 400
-        }
+    results = index.similarity_search(
+        query_text=question,
+        columns=["title", "content"],
+        num_results=3
     )
-    return response["choices"][0]["message"]["content"]
-
-def rag_answer(host, token, question):
-    rows = vector_search(host, token, question)
     context = ""
     sources = []
-    for r in rows:
+    for r in results["result"]["data_array"]:
         title, content = r[0], r[1]
         context += f"[{title}]: {content}\n"
         if title not in sources:
@@ -88,16 +88,10 @@ Context:
 
 Question: {question}
 Answer:"""
-    return call_llm(host, token, prompt), sources
+    return call_llm(prompt, token, host), sources
 
-# Page config
-st.set_page_config(
-    page_title="E-Commerce AI Assistant",
-    page_icon="🛍️",
-    layout="wide"
-)
-
-# Sidebar
+# ── Sidebar ──────────────────────────────────────────────────
+st.sidebar.image("https://upload.wikimedia.org/wikipedia/commons/6/63/Databricks_Logo.png", width=180)
 st.sidebar.title("🛍️ E-Commerce AI")
 st.sidebar.markdown("Built on Databricks Free Edition")
 st.sidebar.markdown("---")
@@ -106,11 +100,11 @@ page = st.sidebar.radio(
     ["💬 Policy Assistant", "📊 Sales Predictions", "📈 Sales Overview"]
 )
 
-w     = get_workspace_client()
+w, vsc = get_clients()
 token = w.config.token
 host  = w.config.host
 
-# Page 1: Policy Assistant
+# ── Page 1: Policy Assistant ─────────────────────────────────
 if page == "💬 Policy Assistant":
     st.title("💬 E-Commerce Policy Assistant")
     st.markdown("Ask anything about our return, shipping, payment, or loyalty policies.")
@@ -126,68 +120,68 @@ if page == "💬 Policy Assistant":
         st.session_state.messages.append({"role": "user", "content": question})
         with st.chat_message("user"):
             st.write(question)
+
         with st.chat_message("assistant"):
             with st.spinner("Searching policies..."):
-                try:
-                    answer, sources = rag_answer(host, token, question)
-                    st.write(answer)
-                    st.caption(f"📚 Sources: {', '.join(sources)}")
-                    st.session_state.messages.append({"role": "assistant", "content": answer})
-                except Exception as e:
-                    st.error(f"Error: {e}")
+                answer, sources = rag_answer(question, vsc, token, host)
+            st.write(answer)
+            st.caption(f"📚 Sources: {', '.join(sources)}")
 
-# Page 2: Sales Predictions
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+
+# ── Page 2: Sales Predictions ────────────────────────────────
 elif page == "📊 Sales Predictions":
     st.title("📊 ML Order Value Predictions")
-    st.markdown("Predictions generated by RandomForest model, stored in Delta Lake.")
+    st.markdown("Predictions generated by our RandomForest model, stored in Delta Lake.")
+
     try:
-        df = read_table(w, "SELECT * FROM ecommerce_demo.sales.order_predictions")
-        if not df.empty:
-            df["predicted_order_value"] = pd.to_numeric(df["predicted_order_value"], errors="coerce")
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Total Customers", len(df))
-            col2.metric("Avg Predicted Value", f"Rs.{df['predicted_order_value'].mean():.2f}")
-            col3.metric("High Value Customers", len(df[df['value_tier'] == 'High Value']))
-            st.markdown("### Predictions Table")
-            st.dataframe(
-                df[["customer_id", "price", "quantity", "predicted_order_value", "value_tier"]],
-                use_container_width=True
-            )
-            st.markdown("### Value Tier Distribution")
-            tier_counts = df["value_tier"].value_counts().reset_index()
-            tier_counts.columns = ["Tier", "Count"]
-            st.bar_chart(tier_counts.set_index("Tier"))
-        else:
-            st.warning("No predictions data found.")
+        df = query_table("ecommerce_demo.sales.order_predictions")
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Customers", len(df))
+        col2.metric("Avg Predicted Value", f"₹{df['predicted_order_value'].mean():.2f}")
+        col3.metric("High Value Customers", len(df[df['value_tier'] == 'High Value']))
+
+        st.markdown("### Predictions Table")
+        st.dataframe(
+            df[["customer_id", "price", "quantity", "predicted_order_value", "value_tier"]],
+            use_container_width=True
+        )
+
+        st.markdown("### Value Tier Distribution")
+        tier_counts = df["value_tier"].value_counts().reset_index()
+        tier_counts.columns = ["Tier", "Count"]
+        st.bar_chart(tier_counts.set_index("Tier"))
+
     except Exception as e:
         st.error(f"Error loading predictions: {e}")
 
-# Page 3: Sales Overview
+# ── Page 3: Sales Overview ───────────────────────────────────
 elif page == "📈 Sales Overview":
     st.title("📈 Sales Overview")
     st.markdown("Live data from your Delta Lake tables.")
+
     try:
-        orders   = read_table(w, "SELECT * FROM ecommerce_demo.sales.orders")
-        products = read_table(w, "SELECT * FROM ecommerce_demo.sales.products")
-        if not orders.empty and not products.empty:
-            products["price"]  = pd.to_numeric(products["price"], errors="coerce")
-            orders["quantity"] = pd.to_numeric(orders["quantity"], errors="coerce")
-            df = orders.merge(products, on="product_id")
-            df["order_value"] = df["price"] * df["quantity"]
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Total Orders", len(df))
-            col2.metric("Total Revenue", f"Rs.{df['order_value'].sum():.2f}")
-            col3.metric("Delivered", len(df[df['status'] == 'delivered']))
-            col4.metric("Returned", len(df[df['status'] == 'returned']))
-            st.markdown("### Revenue by Category")
-            cat_rev = df.groupby("category")["order_value"].sum().reset_index()
-            st.bar_chart(cat_rev.set_index("category"))
-            st.markdown("### Recent Orders")
-            st.dataframe(
-                df[["order_id", "product_name", "category", "quantity", "order_value", "status"]],
-                use_container_width=True
-            )
-        else:
-            st.warning("No sales data found.")
+        orders   = query_table("ecommerce_demo.sales.orders")
+        products = query_table("ecommerce_demo.sales.products")
+        df = orders.merge(products, on="product_id")
+        df["order_value"] = df["price"] * df["quantity"]
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Orders", len(df))
+        col2.metric("Total Revenue", f"₹{df['order_value'].sum():.2f}")
+        col3.metric("Delivered", len(df[df['status'] == 'delivered']))
+        col4.metric("Returned", len(df[df['status'] == 'returned']))
+
+        st.markdown("### Revenue by Category")
+        cat_rev = df.groupby("category")["order_value"].sum().reset_index()
+        st.bar_chart(cat_rev.set_index("category"))
+
+        st.markdown("### Recent Orders")
+        st.dataframe(
+            df[["order_id", "product_name", "category", "quantity", "order_value", "status"]],
+            use_container_width=True
+        )
+
     except Exception as e:
         st.error(f"Error loading sales data: {e}")
